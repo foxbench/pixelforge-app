@@ -108,4 +108,4 @@ Three containers from one image share a single volume (`/data`: the SQLite file 
    - `[slow]`: takes 60 to 90 seconds, good for watching the live status.
    - `[duplicate]`: every webhook is delivered twice: still charged once.
 5. Credits: buy $1 / $5 / $20, see the ledger (hold, release, charge rows).
-6. Admin report at `/admin/report`. On the live site, use the reviewer admin login sent with the application. Locally, run `php artisan app:make-admin <email>`.
+6. Admin report at `/admin/report`. On the live site, ask me for a reviewer admin login (or the email you registered with, and I will make it admin). Locally, run `php artisan app:make-admin <email>`.
