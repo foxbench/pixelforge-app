@@ -2,7 +2,7 @@
 
 # ---- 1. PHP dependencies (production only) ------------------------------------------------
 FROM dunglas/frankenphp:1-php8.4 AS base
-RUN install-php-extensions pdo_sqlite pcntl
+RUN install-php-extensions pdo_sqlite pcntl zip
 WORKDIR /app
 
 FROM base AS vendor
