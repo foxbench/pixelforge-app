@@ -5,7 +5,6 @@ namespace App\Http\Controllers;
 use App\Models\Generation;
 use App\Models\WebhookEvent;
 use App\Services\ApplyGenerationState;
-use Illuminate\Database\UniqueConstraintViolationException;
 use Illuminate\Http\Request;
 use Illuminate\Http\Response;
 use Illuminate\Support\Facades\DB;
@@ -39,33 +38,34 @@ class PixelforgeWebhookController extends Controller
         $snapshot = $event['data']['object'] ?? null;
         $providerId = is_array($snapshot) ? ($snapshot['id'] ?? null) : null;
 
-        try {
-            // One transaction for "remember this event" and "apply it": if applying fails, the
-            // event row is rolled back too, so Pixelforge's retry is not mistaken for a duplicate.
-            DB::transaction(function () use ($event, $snapshot, $providerId, $state) {
-                // event_id is UNIQUE: the second delivery of the same event throws right here.
-                WebhookEvent::create([
-                    'event_id' => $event['id'],
-                    'type' => $event['type'],
-                    'generation_provider_id' => $providerId,
-                    'received_at' => now(),
-                    'payload' => $event,
-                ]);
-
-                if (! is_array($snapshot)) {
-                    return;
-                }
-
-                $generation = $this->findGeneration($snapshot);
-                if ($generation !== null) {
-                    $state->apply($generation, $snapshot);
-                }
-                // Unknown generation: the event stays stored; the poller or a later event settles it.
-            });
-        } catch (UniqueConstraintViolationException) {
+        // One transaction for "remember this event" and "apply it": if applying fails, the event
+        // row is rolled back too, so Pixelforge's retry is not mistaken for a duplicate.
+        DB::transaction(function () use ($event, $snapshot, $providerId, $state) {
             // Duplicate delivery: already handled. Answer 2xx so Pixelforge stops retrying.
-            return response()->noContent();
-        }
+            // Only this check means "duplicate": any unique violation below (even on event_id, if two
+            // deliveries race on MySQL) is a real error, so it bubbles up as a 500 and Pixelforge retries.
+            if (WebhookEvent::where('event_id', $event['id'])->exists()) {
+                return;
+            }
+
+            WebhookEvent::create([
+                'event_id' => $event['id'],
+                'type' => $event['type'],
+                'generation_provider_id' => $providerId,
+                'received_at' => now(),
+                'payload' => $event,
+            ]);
+
+            if (! is_array($snapshot)) {
+                return;
+            }
+
+            $generation = $this->findGeneration($snapshot);
+            if ($generation !== null) {
+                $state->apply($generation, $snapshot);
+            }
+            // Unknown generation: the event stays stored; the poller or a later event settles it.
+        });
 
         return response()->noContent();
     }

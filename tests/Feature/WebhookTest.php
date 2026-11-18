@@ -252,3 +252,21 @@ it('rolls the event back if applying it fails, so the retry is not mistaken for 
     expect(WebhookEvent::count())->toBe(0)
         ->and($generation->fresh()->status)->toBe(GenerationStatus::Queued);
 });
+
+it('does not treat a unique violation other than event_id as a duplicate: it fails with 500 so Pixelforge retries', function () {
+    $generation = heldGeneration();
+    // A leftover release row makes the settlement violate credit_transactions' unique (generation_id, type) index.
+    CreditTransaction::create([
+        'user_id' => $generation->user_id,
+        'type' => CreditTransaction::RELEASE,
+        'amount_pico' => 1,
+        'generation_id' => $generation->id,
+        'description' => 'stray',
+    ]);
+
+    postWebhook($this, webhookEvent('evt_other', 'generation.succeeded', providerGeneration($generation, 'succeeded')))
+        ->assertStatus(500);
+
+    expect(WebhookEvent::count())->toBe(0) // rolled back: the retry will be processed
+        ->and($generation->fresh()->status)->toBe(GenerationStatus::Queued);
+});

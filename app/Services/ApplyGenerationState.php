@@ -18,10 +18,11 @@ use RuntimeException;
  *
  *  - A generation only moves forward (pending_submit < queued < processing < succeeded/failed).
  *    A late "processing" after "succeeded" is ignored.
- *  - succeeded and failed are final. The generation row is locked and the status re-read inside
- *    the transaction, so two concurrent callers cannot both settle it: the second one sees the
- *    final state and does nothing. (credit_transactions also has a unique index on
- *    generation_id + type, so even a bug here could not charge twice.)
+ *  - succeeded and failed are final. The status is re-read inside a write transaction (serialised
+ *    by SQLite's IMMEDIATE mode, or by the row lock on MySQL/Postgres), so two concurrent callers
+ *    cannot both settle it: the second one sees the final state and does nothing.
+ *    (credit_transactions also has a unique index on generation_id + type, so even a bug here
+ *    could not charge twice.)
  *  - Settlement (stored usage, cost, charge, release of the hold, balance) happens in the same
  *    transaction as the status change. All or nothing.
  */
@@ -35,7 +36,8 @@ class ApplyGenerationState
     public function apply(Generation $generation, array $snapshot): Generation
     {
         return DB::transaction(function () use ($generation, $snapshot) {
-            // Lock the row and read it fresh: the copy we were handed may be stale.
+            // Read the row fresh: the copy we were handed may be stale. On SQLite lockForUpdate() is a no-op
+            // (transaction_mode IMMEDIATE in config/database.php serialises writers); on MySQL/Postgres it locks.
             $generation = Generation::whereKey($generation->id)->lockForUpdate()->firstOrFail();
 
             // Facts that are the same in every snapshot: remember them.
@@ -87,6 +89,29 @@ class ApplyGenerationState
 
             if ($generation->status === GenerationStatus::PendingSubmit) {
                 $this->settleFailure($generation, $code, $message, now());
+                $generation->save();
+            }
+
+            return $generation;
+        });
+    }
+
+    /**
+     * Pixelforge keeps saying it has no such generation (the poller got 404 several times in a
+     * row): fail it locally and give the held balance back. Does nothing if it is already final.
+     */
+    public function failNotFound(Generation $generation): Generation
+    {
+        return DB::transaction(function () use ($generation) {
+            $generation = Generation::whereKey($generation->id)->lockForUpdate()->firstOrFail();
+
+            if (! $generation->status->isFinal()) {
+                $this->settleFailure(
+                    $generation,
+                    'provider_not_found',
+                    'Pixelforge no longer knows this generation. You were not charged.',
+                    now(),
+                );
                 $generation->save();
             }
 

@@ -22,9 +22,10 @@ function formData(array $overrides = []): array
     ], $overrides);
 }
 
-/** Run the job once as if it were its Nth attempt, with queue interactions faked. */
+/** Run the job once as if it were its Nth counted attempt (failures so far = N - 1), with queue interactions faked. */
 function runSubmitJob(Generation $generation, int $attempt = 1): SubmitGeneration
 {
+    $generation->update(['submit_failures' => $attempt - 1]);
     $job = (new SubmitGeneration($generation->id))->withFakeQueueInteractions();
     $job->job->attempts = $attempt;
     app()->call([$job, 'handle']);
@@ -189,6 +190,102 @@ describe('SubmitGeneration job', function () {
         expect($generation->fresh()->status)->toBe(GenerationStatus::PendingSubmit);
     });
 
+    it('never fails the generation after repeated network errors: it stays pending with the hold kept', function () {
+        $generation = pendingGeneration(balancePico: Money::parse('2'));
+        $balance = $generation->user->fresh()->balance_pico;
+        Http::fake(fn () => throw new ConnectionException('timed out'));
+
+        $last = runSubmitJob($generation, attempt: 6);
+
+        $generation->refresh();
+        expect($generation->status)->toBe(GenerationStatus::PendingSubmit)
+            ->and($generation->error_code)->toBeNull()
+            ->and($generation->user->fresh()->balance_pico)->toBe($balance) // hold still in place
+            ->and(CreditTransaction::where('type', 'release')->count())->toBe(0);
+        $last->assertNotReleased();
+    });
+
+    it('records when each attempt happened', function () {
+        $generation = pendingGeneration();
+        Http::fake([API.'/generations' => Http::response(['error' => ['code' => 'overloaded', 'message' => 'busy']], 503)]);
+
+        runSubmitJob($generation);
+
+        $generation->refresh();
+        expect($generation->first_submit_attempt_at)->not->toBeNull()
+            ->and($generation->last_submit_attempt_at)->not->toBeNull()
+            ->and($generation->submit_failures)->toBe(1);
+    });
+
+    it('does not count concurrency 429s toward the 6-attempt cap', function () {
+        $generation = pendingGeneration();
+        Http::fake([API.'/generations' => Http::response(['error' => ['code' => 'concurrency_limit_exceeded', 'message' => 'full']], 429, ['Retry-After' => '5'])]);
+
+        // far more than 6 in a row, each released again after 5 seconds
+        for ($attempt = 1; $attempt <= 20; $attempt++) {
+            $job = (new SubmitGeneration($generation->id))->withFakeQueueInteractions();
+            $job->job->attempts = $attempt;
+            app()->call([$job, 'handle']);
+            $job->assertReleased(delay: 5);
+        }
+
+        $generation->refresh();
+        expect($generation->status)->toBe(GenerationStatus::PendingSubmit)
+            ->and($generation->submit_failures)->toBe(0);
+    });
+
+    it('succeeds once a slot frees up after many concurrency 429s', function () {
+        $generation = pendingGeneration();
+        Http::fake([API.'/generations' => Http::sequence()
+            ->push(['error' => ['code' => 'concurrency_limit_exceeded', 'message' => 'full']], 429, ['Retry-After' => '5'])
+            ->push(['error' => ['code' => 'concurrency_limit_exceeded', 'message' => 'full']], 429, ['Retry-After' => '5'])
+            ->push(['error' => ['code' => 'concurrency_limit_exceeded', 'message' => 'full']], 429, ['Retry-After' => '5'])
+            ->push(['error' => ['code' => 'concurrency_limit_exceeded', 'message' => 'full']], 429, ['Retry-After' => '5'])
+            ->push(['error' => ['code' => 'concurrency_limit_exceeded', 'message' => 'full']], 429, ['Retry-After' => '5'])
+            ->push(['error' => ['code' => 'concurrency_limit_exceeded', 'message' => 'full']], 429, ['Retry-After' => '5'])
+            ->push(['error' => ['code' => 'concurrency_limit_exceeded', 'message' => 'full']], 429, ['Retry-After' => '5'])
+            ->push(['error' => ['code' => 'concurrency_limit_exceeded', 'message' => 'full']], 429, ['Retry-After' => '5'])
+            ->push(providerGeneration($generation, 'queued', ['id' => 'gen_LATE']), 202)]);
+
+        // 8 refusals (more than the 6-attempt cap), then a slot frees up
+        for ($attempt = 1; $attempt <= 9; $attempt++) {
+            $job = (new SubmitGeneration($generation->id))->withFakeQueueInteractions();
+            $job->job->attempts = $attempt;
+            app()->call([$job, 'handle']);
+        }
+
+        expect($generation->fresh()->status)->toBe(GenerationStatus::Queued)
+            ->and($generation->fresh()->provider_id)->toBe('gen_LATE');
+    });
+
+    it('stops waiting for concurrency after 15 minutes: fails the generation and releases the hold', function () {
+        $generation = pendingGeneration(balancePico: Money::parse('2'));
+        $generation->update(['first_submit_attempt_at' => now()->subMinutes(16)]);
+        Http::fake([API.'/generations' => Http::response(['error' => ['code' => 'concurrency_limit_exceeded', 'message' => 'full']], 429, ['Retry-After' => '5'])]);
+
+        $job = (new SubmitGeneration($generation->id))->withFakeQueueInteractions();
+        app()->call([$job, 'handle']);
+
+        $generation->refresh();
+        expect($generation->status)->toBe(GenerationStatus::Failed)
+            ->and($generation->error_code)->toBe('submit_gave_up')
+            ->and($generation->user->fresh()->balance_pico)->toBe(Money::parse('2'))
+            ->and(CreditTransaction::where('type', 'release')->count())->toBe(1);
+        $job->assertNotReleased();
+    });
+
+    it('keeps waiting for concurrency while still inside the 15 minutes', function () {
+        $generation = pendingGeneration();
+        $generation->update(['first_submit_attempt_at' => now()->subMinutes(14)]);
+        Http::fake([API.'/generations' => Http::response(['error' => ['code' => 'concurrency_limit_exceeded', 'message' => 'full']], 429, ['Retry-After' => '5'])]);
+
+        $job = (new SubmitGeneration($generation->id))->withFakeQueueInteractions();
+        app()->call([$job, 'handle']);
+
+        $job->assertReleased(delay: 5);
+        expect($generation->fresh()->status)->toBe(GenerationStatus::PendingSubmit);
+    });
+
     it('fails permanently and refunds on a rejection', function (int $status, string $code) {
         $generation = pendingGeneration(balancePico: Money::parse('2'));
         Http::fake([API.'/generations' => Http::response(['error' => ['code' => $code, 'message' => "rejected: {$code}"]], $status)]);
@@ -279,16 +376,100 @@ describe('polling fallback', function () {
             ->and($good->fresh()->status)->toBe(GenerationStatus::Failed);
     });
 
-    it('resubmits generations stuck in pending_submit for more than 5 minutes', function () {
+    it('resubmits generations stuck in pending_submit whose last attempt is over 10 minutes old', function () {
         Queue::fake();
         $stuck = pendingGeneration();
+        $retrying = pendingGeneration(); // its job is still retrying: tried 2 minutes ago
         $fresh = pendingGeneration();
-        Generation::whereKey($stuck->id)->update(['updated_at' => now()->subMinutes(6)]);
+        $stuck->update(['last_submit_attempt_at' => now()->subMinutes(11), 'first_submit_attempt_at' => now()->subMinutes(30), 'submit_failures' => 5]);
+        $retrying->update(['last_submit_attempt_at' => now()->subMinutes(2)]);
+        Generation::whereKey($retrying->id)->update(['created_at' => now()->subMinutes(30)]);
 
         $this->artisan('app:poll-generations')->assertSuccessful();
 
         Queue::assertPushed(SubmitGeneration::class, 1);
         Queue::assertPushed(SubmitGeneration::class, fn ($job) => $job->generationId === $stuck->id);
-        expect($fresh->fresh()->status)->toBe(GenerationStatus::PendingSubmit);
+        $stuck->refresh();
+        // the new job starts with a clean failure count and time budget, and is not re-dispatched next minute
+        expect($stuck->submit_failures)->toBe(0)
+            ->and($stuck->first_submit_attempt_at)->toBeNull()
+            ->and($stuck->last_submit_attempt_at->isAfter(now()->subMinute()))->toBeTrue()
+            ->and($fresh->fresh()->status)->toBe(GenerationStatus::PendingSubmit);
+    });
+
+    it('resubmits a pending generation that was never attempted once it is 10 minutes old', function () {
+        Queue::fake();
+        $lost = pendingGeneration();
+        Generation::whereKey($lost->id)->update(['created_at' => now()->subMinutes(11)]);
+
+        $this->artisan('app:poll-generations')->assertSuccessful();
+
+        Queue::assertPushed(SubmitGeneration::class, fn ($job) => $job->generationId === $lost->id);
+    });
+
+    it('stops the run when Pixelforge answers 429', function () {
+        heldGeneration(attributes: ['provider_id' => 'gen_ONE']);
+        heldGeneration(attributes: ['provider_id' => 'gen_TWO']);
+        Generation::query()->update(['updated_at' => now()->subMinutes(2)]);
+        Http::fake([API.'/generations/*' => Http::response(['error' => ['code' => 'rate_limit_exceeded']], 429, ['Retry-After' => '30'])]);
+
+        $this->artisan('app:poll-generations')->assertSuccessful();
+
+        Http::assertSentCount(1);
+    });
+
+    it('stops the run when 5 or fewer requests are left this minute', function () {
+        $first = heldGeneration(attributes: ['provider_id' => 'gen_ONE']);
+        heldGeneration(attributes: ['provider_id' => 'gen_TWO']);
+        Generation::query()->update(['updated_at' => now()->subMinutes(2)]);
+        Http::fake([API.'/generations/*' => Http::response(providerGeneration($first, 'processing'), 200, ['X-RateLimit-Remaining' => '5'])]);
+
+        $this->artisan('app:poll-generations')->assertSuccessful();
+
+        Http::assertSentCount(1);
+    });
+
+    it('keeps polling while plenty of requests are left', function () {
+        $first = heldGeneration(attributes: ['provider_id' => 'gen_ONE']);
+        heldGeneration(attributes: ['provider_id' => 'gen_TWO']);
+        Generation::query()->update(['updated_at' => now()->subMinutes(2)]);
+        Http::fake([API.'/generations/*' => Http::response(providerGeneration($first, 'processing'), 200, ['X-RateLimit-Remaining' => '40'])]);
+
+        $this->artisan('app:poll-generations')->assertSuccessful();
+
+        Http::assertSentCount(2);
+    });
+
+    it('fails a generation Pixelforge has not found 3 polls in a row, and releases the hold', function () {
+        $generation = heldGeneration(balancePico: Money::parse('2'), attributes: ['provider_id' => 'gen_GONE']);
+        Http::fake([API.'/generations/gen_GONE' => Http::response(['error' => ['code' => 'not_found']], 404)]);
+
+        foreach ([1, 2] as $run) {
+            Generation::query()->update(['updated_at' => now()->subMinutes(2)]);
+            $this->artisan('app:poll-generations')->assertSuccessful();
+            expect($generation->fresh()->status)->toBe(GenerationStatus::Queued)
+                ->and($generation->fresh()->poll_not_found_count)->toBe($run);
+        }
+
+        Generation::query()->update(['updated_at' => now()->subMinutes(2)]);
+        $this->artisan('app:poll-generations')->assertSuccessful();
+
+        $generation->refresh();
+        expect($generation->status)->toBe(GenerationStatus::Failed)
+            ->and($generation->error_code)->toBe('provider_not_found')
+            ->and($generation->charge_pico)->toBe(0)
+            ->and($generation->user->fresh()->balance_pico)->toBe(Money::parse('2'))
+            ->and(CreditTransaction::where('type', 'release')->count())->toBe(1);
+    });
+
+    it('resets the not-found count when Pixelforge finds the generation again', function () {
+        $generation = heldGeneration(attributes: ['provider_id' => 'gen_BLIP', 'poll_not_found_count' => 2]);
+        Generation::query()->update(['updated_at' => now()->subMinutes(2)]);
+        Http::fake([API.'/generations/gen_BLIP' => Http::response(providerGeneration($generation, 'processing'))]);
+
+        $this->artisan('app:poll-generations')->assertSuccessful();
+
+        expect($generation->fresh()->poll_not_found_count)->toBe(0)
+            ->and($generation->fresh()->status)->toBe(GenerationStatus::Processing);
     });
 });

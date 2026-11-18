@@ -2,6 +2,12 @@
 set -e
 cd /app
 
+# Without APP_KEY, sessions and encrypted data cannot work: stop now with a clear message.
+if [ -z "${APP_KEY:-}" ]; then
+    echo "ERROR: APP_KEY is empty. Set it in .env (generate one with: php artisan key:generate --show)." >&2
+    exit 1
+fi
+
 # One volume (/data) holds everything that must survive a redeploy:
 # the SQLite file and Laravel's storage directory. web, queue and scheduler all mount it.
 mkdir -p /data/storage/app/public /data/storage/framework/cache /data/storage/framework/sessions \

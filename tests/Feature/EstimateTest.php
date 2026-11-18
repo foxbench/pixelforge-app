@@ -81,3 +81,18 @@ it('requires login and valid parameters for the estimate', function () {
         ->getJson('/generations/estimate?chars=1&size=huge&quality=low&images=0')
         ->assertUnprocessable();
 });
+
+it('rounds the text variance up in basis points, so the maximum is never short', function () {
+    // 15.49% variance: the old round(0.1549 * 100) = 15% would give 1150 tokens for 1000 typical ones.
+    $pricing = app(App\Services\Pixelforge\PricingService::class)->get();
+    $pricing['tokens']['text_token_variance'] = 0.1549;
+    Cache::put('pixelforge.pricing', $pricing, now()->addMinutes(10));
+
+    $withVariance = app(CostEstimator::class)->estimate(4000, '1024x1024', 'low', 0); // 1000 typical text tokens
+    $pricing['tokens']['text_token_variance'] = 0.15;
+    Cache::put('pixelforge.pricing', $pricing, now()->addMinutes(10));
+    $plain = app(CostEstimator::class)->estimate(4000, '1024x1024', 'low', 0);
+
+    // 1000 * 1.1549 = 1154.9 -> 1155 tokens, against 1150 at 15%: 5 more tokens at $5 per million
+    expect($withVariance->maxCostPico - $plain->maxCostPico)->toBe(Money::parse('0.000025'));
+});

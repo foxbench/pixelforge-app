@@ -64,7 +64,8 @@ class GenerationController extends Controller
         );
 
         $generation = DB::transaction(function () use ($request, $data, $estimate, $ledger) {
-            // Lock the user's row so two simultaneous submits can't both spend the same balance.
+            // Two simultaneous submits must not both spend the same balance. On SQLite lockForUpdate() is a
+            // no-op (transaction_mode IMMEDIATE in config/database.php serialises writers); on MySQL/Postgres it locks.
             $user = User::whereKey($request->user()->id)->lockForUpdate()->firstOrFail();
 
             if ($user->balance_pico < $estimate->maxChargePico) {

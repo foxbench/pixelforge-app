@@ -46,14 +46,13 @@ class PixelforgeClient
     }
 
     /**
-     * @return array<string, mixed>
+     * Returns the raw response (the caller decides what 404 / 429 mean, and reads X-RateLimit-Remaining).
      *
-     * @throws RequestException
-     * @throws ConnectionException
+     * @throws ConnectionException on network failure
      */
-    public function getGeneration(string $providerId): array
+    public function getGeneration(string $providerId): Response
     {
-        return $this->http()->get('generations/'.$providerId)->throw()->json();
+        return $this->http()->get('generations/'.$providerId);
     }
 
     /**

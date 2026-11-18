@@ -33,10 +33,12 @@ RUN composer dump-autoload --no-dev --optimize --no-interaction \
     && cp .env.example .env.build && rm .env.build \
     && chmod +x docker/entrypoint.sh
 
-# Plain HTTP on port 80: TLS is terminated by the reverse proxy in front of this container.
+# Plain HTTP on port 80: TLS is terminated by the reverse proxy in front of this container, so
+# browsers see HTTPS and the session cookie can be marked Secure.
 ENV SERVER_NAME=":80" \
     APP_ENV=production \
     APP_DEBUG=false \
+    SESSION_SECURE_COOKIE=true \
     DB_CONNECTION=sqlite \
     DB_DATABASE=/data/database.sqlite \
     QUEUE_CONNECTION=database \

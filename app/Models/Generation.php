@@ -27,6 +27,8 @@ class Generation extends Model
             'image_url_expires_at' => 'datetime',
             'submitted_at' => 'datetime',
             'completed_at' => 'datetime',
+            'first_submit_attempt_at' => 'datetime',
+            'last_submit_attempt_at' => 'datetime',
         ];
     }
 
