@@ -2,6 +2,8 @@
 
 A small Laravel 12 + Vue 3 + Inertia app on top of the (simulated) Pixelforge image API. Users register, generate images, watch the status change, see an estimate before they submit and the exact cost afterwards. They pay Pixelforge's cost plus 25%. Failed generations are free.
 
+Live: https://imagegen.iwp.im
+
 Stack: PHP 8.4+, Laravel 12, Inertia 2, Vue 3 (the official Laravel Vue starter kit), Tailwind, SQLite, database queue, Pest.
 
 ## What it does
@@ -106,4 +108,4 @@ Three containers from one image share a single volume (`/data`: the SQLite file 
    - `[slow]`: takes 60 to 90 seconds, good for watching the live status.
    - `[duplicate]`: every webhook is delivered twice: still charged once.
 5. Credits: buy $1 / $5 / $20, see the ledger (hold, release, charge rows).
-6. Admin report: an admin runs `php artisan app:make-admin <email>`; the report is then at `/admin/report`.
+6. Admin report at `/admin/report`. On the live site, use the reviewer admin login sent with the application. Locally, run `php artisan app:make-admin <email>`.
